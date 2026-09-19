@@ -1,19 +1,17 @@
 import {
-  appendFileSync,
   closeSync,
-  copyFileSync,
   existsSync,
   mkdirSync,
   openSync,
   readFileSync,
   readSync,
-  readdirSync,
   renameSync,
-  statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { randomBytes, randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { dirname, isAbsolute, join } from "node:path";
+import { isWorkflowPresetPolicy, type WorkflowPresetPolicy } from "./workflow-presets.ts";
 
 export interface SessionEntry {
   type: string;
@@ -33,29 +31,58 @@ export interface MessageEntry extends SessionEntry {
 export type SeededSubagentSessionMode = "lineage-only" | "fork";
 
 function getForkContentLines(parentSessionFile: string): string[] {
-  const raw = readFileSync(parentSessionFile, "utf8");
-  const lines = raw.split("\n").filter((line) => line.trim());
+  const lines = readFileSync(parentSessionFile, "utf8")
+    .split("\n")
+    .filter((line) => line.trim());
+  const parsedLines: Array<{ line: string; entry: SessionEntry }> = [];
 
-  let truncateAt = lines.length;
-  for (let i = lines.length - 1; i >= 0; i--) {
+  for (const line of lines) {
     try {
-      const entry = JSON.parse(lines[i]);
-      if (entry.type === "message" && entry.message?.role === "user") {
-        truncateAt = i;
-        break;
-      }
+      const entry = JSON.parse(line) as SessionEntry;
+      if (entry.type !== "session") parsedLines.push({ line, entry });
     } catch {
-      // ignore malformed lines
+      // Pi skips malformed session lines when loading them, so they cannot be ancestry.
     }
   }
 
-  return lines.slice(0, truncateAt).filter((line) => {
-    try {
-      return JSON.parse(line).type !== "session";
-    } catch {
-      return true;
+  // The direct CLI prompt delivers the invoking task again in the child. Seed
+  // only the selected branch before that task: its parent is the active leaf
+  // Pi used when it appended the latest user message. Physical JSONL adjacency
+  // is not branch identity because replaced turns remain in the append-only file.
+  let invokingTask: SessionEntry | undefined;
+  for (let i = parsedLines.length - 1; i >= 0; i--) {
+    const entry = parsedLines[i].entry as SessionEntry & {
+      message?: { role?: unknown };
+    };
+    if (entry.type === "message" && entry.message?.role === "user") {
+      invokingTask = entry;
+      break;
     }
-  });
+  }
+
+  // Match SessionManager's id/parentId traversal semantics while retaining the
+  // original JSON for every selected entry (including model and compaction metadata).
+  const byId = new Map<string, { line: string; entry: SessionEntry }>();
+  for (const parsed of parsedLines) {
+    if (typeof parsed.entry.id === "string") byId.set(parsed.entry.id, parsed);
+  }
+
+  const reversePath: string[] = [];
+  const visited = new Set<string>();
+  // A normal tool invocation has a latest user task, whose parent is the
+  // pre-task leaf. For a user-less synthetic/legacy session, preserve Pi's
+  // default active leaf (the last valid entry) instead of discarding history.
+  let currentId = invokingTask
+    ? (typeof invokingTask.parentId === "string" ? invokingTask.parentId : undefined)
+    : parsedLines.at(-1)?.entry.id;
+  while (currentId && !visited.has(currentId)) {
+    visited.add(currentId);
+    const current = byId.get(currentId);
+    if (!current) break;
+    reversePath.push(current.line);
+    currentId = typeof current.entry.parentId === "string" ? current.entry.parentId : undefined;
+  }
+  return reversePath.reverse();
 }
 
 export function seedSubagentSessionFile(params: {
@@ -94,14 +121,21 @@ export function seedSubagentSessionFile(params: {
  * deleted.
  */
 export interface SubagentLoadout {
-  /** Agent profile name (for PI_SUBAGENT_AGENT); null for agentless spawns. */
+  /** Snapshot schema and runtime discriminator; unsupported values are never resumed. */
+  schemaVersion: 2;
+  runtime: "pi";
+  /** Agent profile name (for PI_SUBAGENT_AGENT). */
   agent: string | null;
-  /** The `--tools` allowlist string, or null when the spawn was unrestricted. */
-  toolAllowlist: string | null;
+  /** The non-empty `--tools` allowlist string. */
+  toolAllowlist: string;
+  /** Absolute backing-extension paths resolved when the subagent was spawned. */
+  extensionPaths: string[];
   /** Model id (without thinking suffix), or null to use the session default. */
   model: string | null;
   /** Thinking level appended to the model as `model:level`, or null. */
   thinking: string | null;
+  /** Workflow policy inherited by fresh nested children; absent on legacy snapshots. */
+  workflowPreset?: WorkflowPresetPolicy;
   /** How the identity text was applied: append/replace, or null. */
   systemPromptMode: "append" | "replace" | null;
   /** The system-prompt/identity text, only when it lived in the system prompt. */
@@ -123,12 +157,10 @@ export function loadoutSidecarPath(sessionFile: string): string {
 
 /** Persist a subagent's resolved sandbox loadout beside its session file. */
 export function writeSubagentLoadout(sessionFile: string, loadout: SubagentLoadout): void {
-  try {
-    writeFileSync(loadoutSidecarPath(sessionFile), JSON.stringify(loadout), "utf8");
-  } catch {
-    // Best-effort: a missing snapshot only means resume will refuse, never that
-    // it launches unrestricted.
-  }
+  writeFileSync(loadoutSidecarPath(sessionFile), JSON.stringify(loadout), {
+    encoding: "utf8",
+    mode: 0o600,
+  });
 }
 
 /** Read a subagent's loadout snapshot, or null if absent/unparseable. */
@@ -138,6 +170,44 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
     if (!existsSync(p)) return null;
     const parsed = JSON.parse(readFileSync(p, "utf8"));
     if (!parsed || typeof parsed !== "object") return null;
+    if (parsed.schemaVersion !== 2 || parsed.runtime !== "pi") return null;
+    const nullableString = (value: unknown): boolean => value === null || typeof value === "string";
+    if (!nullableString(parsed.agent)) return null;
+    if (typeof parsed.toolAllowlist !== "string" || !parsed.toolAllowlist.trim()) return null;
+    const tools = parsed.toolAllowlist.split(",").map((tool: string) => tool.trim());
+    if (tools.some((tool: string) => !tool)) return null;
+    if (
+      !Array.isArray(parsed.extensionPaths) ||
+      !parsed.extensionPaths.every(
+        (extensionPath: unknown) =>
+          typeof extensionPath === "string" &&
+          extensionPath.length > 0 &&
+          isAbsolute(extensionPath),
+      )
+    ) return null;
+    if (!nullableString(parsed.model) || !nullableString(parsed.thinking)) return null;
+    if (
+      Object.hasOwn(parsed, "workflowPreset") &&
+      !isWorkflowPresetPolicy(parsed.workflowPreset)
+    ) return null;
+    if (
+      parsed.systemPromptMode !== null &&
+      parsed.systemPromptMode !== "append" &&
+      parsed.systemPromptMode !== "replace"
+    ) return null;
+    if (!nullableString(parsed.identity)) return null;
+    if (
+      parsed.spawnable !== null &&
+      (!Array.isArray(parsed.spawnable) ||
+        parsed.spawnable.length === 0 ||
+        !parsed.spawnable.every((name: unknown) => typeof name === "string" && name.trim()))
+    ) return null;
+    const spawningTools = new Set(["subagent", "subagent_message", "subagents_list"]);
+    if (tools.some((tool: string) => spawningTools.has(tool)) && parsed.spawnable === null) {
+      return null;
+    }
+    if (typeof parsed.autoExit !== "boolean") return null;
+    if (!nullableString(parsed.cwd) || !nullableString(parsed.agentDir)) return null;
     return parsed as SubagentLoadout;
   } catch {
     return null;
@@ -190,17 +260,22 @@ export function registerName(
   name: string,
   entry: NameRegistryEntry,
 ): void {
+  mkdirSync(artifactDir, { recursive: true });
+  const registry = readNameRegistry(artifactDir);
+  Object.defineProperty(registry, name, {
+    value: entry,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
+  const p = nameRegistryPath(artifactDir);
+  const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
   try {
-    mkdirSync(artifactDir, { recursive: true });
-    const registry = readNameRegistry(artifactDir);
-    registry[name] = entry;
-    const p = nameRegistryPath(artifactDir);
-    const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
-    writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
+    writeFileSync(tmp, JSON.stringify(registry, null, 2), { encoding: "utf8", mode: 0o600 });
     renameSync(tmp, p);
-  } catch {
-    // Best-effort: a failed registration only means resume-by-name won't find
-    // this subagent later; it never breaks the spawn itself.
+  } catch (error) {
+    try { unlinkSync(tmp); } catch {}
+    throw error;
   }
 }
 
@@ -209,8 +284,12 @@ export function resolveNameInRegistry(
   artifactDir: string,
   name: string,
 ): NameRegistryEntry | null {
-  const entry = readNameRegistry(artifactDir)[name];
-  return entry && typeof entry.sessionFile === "string" ? entry : null;
+  const registry = readNameRegistry(artifactDir);
+  if (!Object.hasOwn(registry, name)) return null;
+  const entry = registry[name];
+  return entry && typeof entry === "object" && typeof entry.sessionFile === "string"
+    ? entry
+    : null;
 }
 
 function readEntries(sessionFile: string): SessionEntry[] {
@@ -219,14 +298,6 @@ function readEntries(sessionFile: string): SessionEntry[] {
     .split("\n")
     .filter((line) => line.trim())
     .map((line) => JSON.parse(line) as SessionEntry);
-}
-
-/**
- * Return the id of the last entry in the session file (current branch point / leaf).
- */
-export function getLeafId(sessionFile: string): string | null {
-  const entries = readEntries(sessionFile);
-  return entries.length > 0 ? entries[entries.length - 1].id : null;
 }
 
 /**
@@ -279,157 +350,6 @@ function readHeaderId(sessionFile: string): string | null {
   } catch {
     return null;
   }
-}
-
-/**
- * Resolve a session id (or id prefix) to a session file path by scanning every
- * `*.jsonl` under `sessionsRoot` and matching the header `id`. Mirrors pi's own
- * resolution order: exact match first, then prefix match. Most recently
- * modified file wins on ties. Returns null when nothing matches.
- */
-/**
- * In-process index of session id → session file, per sessions root.
- *
- * Resolving a session id naively walks every `.jsonl` under the sessions tree
- * and reads each header. With a few thousand sessions that is thousands of
- * synchronous open/read/stat syscalls — on the extension host's single thread
- * that blocks the entire terminal UI for many seconds (measured ~67s on a
- * 2010-file tree). To avoid that, we build the index once per root and cache
- * it; subsequent lookups are O(1). The cache is validated cheaply (a directory
- * listing plus statSync-only mtime checks) on every call, so new sessions are
- * picked up without re-reading unchanged headers and without ever freezing the
- * UI again.
- */
-interface SessionIndex {
-  idToFile: Map<string, { path: string; mtime: number }>;
-  /** file path → mtime when indexed (staleness detection). */
-  files: Map<string, number>;
-  /** top-level dir signature used to detect newly added cwd dirs. */
-  topSig: string;
-}
-const sessionIndexCache = new Map<string, SessionIndex>();
-
-function topLevelSignature(root: string): string {
-  const parts: string[] = [];
-  let entries: import("node:fs").Dirent[];
-  try {
-    entries = readdirSync(root, { withFileTypes: true });
-  } catch {
-    return "";
-  }
-  for (const e of entries) {
-    const full = join(root, e.name);
-    if (e.isDirectory()) {
-      let m = 0;
-      try {
-        m = statSync(full).mtimeMs;
-      } catch {
-        /* ignore */
-      }
-      parts.push(`d:${e.name}:${m}`);
-    } else if (e.isFile() && e.name.endsWith(".jsonl")) {
-      parts.push(`f:${e.name}`);
-    }
-  }
-  parts.sort();
-  return parts.join("|");
-}
-
-/** Recursively index new/changed .jsonl files under dir into idx. */
-function indexDir(dir: string, idx: SessionIndex): void {
-  let entries: import("node:fs").Dirent[];
-  try {
-    entries = readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return;
-  }
-  for (const entry of entries) {
-    const full = join(dir, entry.name);
-    if (entry.isDirectory()) {
-      indexDir(full, idx);
-    } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-      let mtime = 0;
-      try {
-        mtime = statSync(full).mtimeMs;
-      } catch {
-        continue;
-      }
-      const known = idx.files.get(full);
-      if (known !== undefined && known === mtime) continue; // unchanged
-      const id = readHeaderId(full); // only read headers for new/changed files
-      idx.files.set(full, mtime);
-      if (!id) continue;
-      const prev = idx.idToFile.get(id);
-      if (!prev || mtime >= prev.mtime) {
-        idx.idToFile.set(id, { path: full, mtime });
-      }
-    }
-  }
-}
-
-function getSessionIndex(sessionsRoot: string): SessionIndex {
-  let idx = sessionIndexCache.get(sessionsRoot);
-  const sig = topLevelSignature(sessionsRoot);
-  if (!idx) {
-    idx = { idToFile: new Map(), files: new Map(), topSig: sig };
-    sessionIndexCache.set(sessionsRoot, idx);
-    indexDir(sessionsRoot, idx); // first build: full scan, once per process
-  } else if (idx.topSig !== sig) {
-    idx.topSig = sig;
-    indexDir(sessionsRoot, idx); // a cwd dir was added/changed: incremental rescan
-  } else {
-    indexDir(sessionsRoot, idx); // cheap: stats files, reads only new/changed headers
-  }
-  return idx;
-}
-
-export function resolveSessionFileById(sessionId: string, sessionsRoot: string): string | null {
-  if (!sessionId || !existsSync(sessionsRoot)) return null;
-  const idx = getSessionIndex(sessionsRoot);
-  return lookupSessionIndex(idx, sessionId);
-}
-
-function lookupSessionIndex(
-  idx: { idToFile: Map<string, { path: string; mtime: number }> },
-  sessionId: string,
-): string | null {
-  // Exact match first.
-  const exact = idx.idToFile.get(sessionId);
-  if (exact && existsSync(exact.path)) return exact.path;
-
-  // Prefix match: most recently modified wins (ids are unique in practice, so
-  // this is only a convenience for hand-typed short prefixes).
-  let best: { path: string; mtime: number } | null = null;
-  for (const [id, rec] of idx.idToFile) {
-    if (!id.startsWith(sessionId)) continue;
-    if (!existsSync(rec.path)) continue;
-    if (!best || rec.mtime > best.mtime) best = rec;
-  }
-  return best ? best.path : null;
-}
-
-/**
- * Async variant used by the interactive resume path. Index building/refresh is
- * synchronous I/O, which can take many seconds on a cold OS page cache with a
- * few thousand sessions; running it synchronously would block the extension
- * host's single thread and freeze the terminal UI. Deferring to a macrotask
- * keeps the event loop responsive. The heavy work only happens on the first
- * resolution per process (and incrementally thereafter); warm lookups are ~50ms.
- */
-export async function resolveSessionFileByIdAsync(
-  sessionId: string,
-  sessionsRoot: string,
-): Promise<string | null> {
-  if (!sessionId || !existsSync(sessionsRoot)) return null;
-  // Let the event loop breathe (and the UI repaint) before the sync scan.
-  await new Promise<void>((r) => setImmediate(r));
-  const idx = getSessionIndex(sessionsRoot);
-  return lookupSessionIndex(idx, sessionId);
-}
-
-/** Test hook: drop the cached session index so tests start clean. */
-export function resetSessionIndexCache(): void {
-  sessionIndexCache.clear();
 }
 
 /**
@@ -498,56 +418,6 @@ export function findLastAssistantMessage(entries: SessionEntry[]): string | null
     }
   }
   return null;
-}
-
-/**
- * Append a branch_summary entry to the session file.
- * Returns the new entry's id.
- */
-export function appendBranchSummary(
-  sessionFile: string,
-  branchPointId: string,
-  fromId: string | null,
-  summary: string,
-): string {
-  const id = randomBytes(4).toString("hex");
-  const entry = {
-    type: "branch_summary",
-    id,
-    parentId: branchPointId,
-    timestamp: new Date().toISOString(),
-    fromId: fromId ?? branchPointId,
-    summary,
-  };
-  appendFileSync(sessionFile, JSON.stringify(entry) + "\n", "utf8");
-  return id;
-}
-
-/**
- * Copy the session file to destDir for parallel worker isolation.
- * Returns the path of the copy.
- */
-export function copySessionFile(sessionFile: string, destDir: string): string {
-  const id = randomBytes(4).toString("hex");
-  const dest = join(destDir, `subagent-${id}.jsonl`);
-  copyFileSync(sessionFile, dest);
-  return dest;
-}
-
-/**
- * Read new entries from sourceFile (after afterLine), append them to targetFile.
- * Returns the appended entries.
- */
-export function mergeNewEntries(
-  sourceFile: string,
-  targetFile: string,
-  afterLine: number,
-): SessionEntry[] {
-  const entries = getNewEntries(sourceFile, afterLine);
-  for (const entry of entries) {
-    appendFileSync(targetFile, JSON.stringify(entry) + "\n", "utf8");
-  }
-  return entries;
 }
 
 export interface SessionStats {

@@ -4,7 +4,7 @@
  * - Provides an `ask_question` tool for asking the parent orchestrator a question
  *
  * Subagents do NOT self-terminate via a tool. Auto-exit agents shut down
- * automatically when their agent loop ends (see the `agent_end` handler);
+ * automatically only after Pi reports `agent_settled`;
  * interactive agents end when the human exits the pane.
  *
  * `ask_question` keeps the session OPEN: it writes a `${sessionFile}.ask`
@@ -12,11 +12,17 @@
  * (auto-exit is suppressed for that turn via `awaitingAnswer`), and the parent
  * replies with subagent_message — which lands as the subagent's next turn.
  */
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Box, Text } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import {
+  connectChildRunControl,
+  type ChildRunControl,
+  type RunControlIdentity,
+} from "./control.ts";
+import { writeCompletionRecord } from "./run-state.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -29,9 +35,9 @@ export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
  * children (e.g. a worker delegating to scout/researcher), `index.ts` runs in
  * the same process and publishes a live count through a shared process-global
  * symbol. A subagent that spawns children and then writes a "waiting for
- * results" message would otherwise auto-exit the instant that turn ends —
+ * results" message would otherwise auto-exit as soon as the run settles —
  * killing the session before its children report back. Reading this count lets
- * `agent_end` keep the session open until every child has finished and its
+ * `agent_settled` keep the session open until every child has finished and its
  * result has been delivered.
  *
  * Returns 0 when the spawning tools aren't loaded (scout/researcher, or a
@@ -124,6 +130,15 @@ export default function (pi: ExtensionAPI) {
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
   });
+  const runId = process.env.PI_SUBAGENT_ID;
+  const sessionFile = process.env.PI_SUBAGENT_SESSION;
+  const controlToken = process.env.PI_SUBAGENT_CONTROL_TOKEN;
+  const controlSocket = process.env.PI_SUBAGENT_CONTROL_SOCKET;
+  const completionFile = process.env.PI_SUBAGENT_COMPLETION_FILE;
+  const controlIdentity: RunControlIdentity | null = runId && sessionFile && controlToken
+    ? { runId, sessionFile, token: controlToken }
+    : null;
+  let control: ChildRunControl | null = null;
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
     ctx.ui.setWidget(
@@ -187,6 +202,20 @@ export default function (pi: ExtensionAPI) {
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
     recorder.sessionStart();
+    if (!control && controlIdentity && controlSocket) {
+      control = connectChildRunControl({
+        identity: controlIdentity,
+        socketPath: controlSocket,
+        dispatch(message) {
+          if (ctx.isIdle()) {
+            pi.sendUserMessage(message);
+            return "immediate";
+          }
+          pi.sendUserMessage(message, { deliverAs: "steer" });
+          return "steer";
+        },
+      });
+    }
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);
@@ -223,57 +252,46 @@ export default function (pi: ExtensionAPI) {
     recorder.agentStart();
   });
 
-  pi.on("agent_end", (event, ctx) => {
-    const messages = (event as any).messages as any[] | undefined;
-    // Never shut down while this session still has work in flight:
-    //  - awaitingAnswer: an ask_question is pending the orchestrator's reply.
-    //  - runningChildrenCount(): this subagent spawned its own children and is
-    //    waiting for their results (delivered as steered turns). Exiting now
-    //    would strand those children and drop their results.
-    // In both cases the session parks as `waiting` and resumes when the next
-    // turn lands.
+  let latestAgentMessages: any[] | undefined;
+
+  // agent_end is not terminal: Pi may still retry, compact-and-retry, or consume
+  // queued steering/follow-up messages. Save its messages, but decide shutdown
+  // only at agent_settled.
+  pi.on("agent_end", (event) => {
+    latestAgentMessages = (event as any).messages as any[] | undefined;
+  });
+
+  pi.on("agent_settled", (_event, ctx) => {
     const hasPendingChildren = runningChildrenCount() > 0;
     const shouldExit =
       !awaitingAnswer &&
       !hasPendingChildren &&
       autoExit &&
-      shouldAutoExitOnAgentEnd(userTookOver, messages);
+      shouldAutoExitOnAgentEnd(userTookOver, latestAgentMessages);
 
-    if (shouldExit) {
-      // Surface stopReason: "error" turns (auto-retry exhausted, provider
-      // overload, etc.) to the parent via the .exit sidecar so the watcher
-      // can report a clear failure with the underlying error message.
-      // Without this the parent would only see exit code 0 and a stale
-      // assistant message, mistaking the crash for a successful completion.
-      const errorInfo = findLatestAssistantError(messages);
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo && sessionFile) {
-        try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
-          );
-        } catch {
-          // Best effort — even without the sidecar, watcher's session-file
-          // fallback can still recover the errorMessage.
-        }
-      }
-
-      recorder.agentEndDone();
-      ctx.shutdown();
+    if (!shouldExit) {
+      recorder.agentEndWaiting();
+      if (autoExit) userTookOver = false;
       return;
     }
 
-    recorder.agentEndWaiting();
-    if (autoExit) {
-      // Reset any recorded manual input marker. Auto-exit is decided by whether
-      // the latest agent turn completed normally, not by who initiated it.
-      userTookOver = false;
+    const errorInfo = findLatestAssistantError(latestAgentMessages);
+    if (controlIdentity && completionFile) {
+      try {
+        writeCompletionRecord(
+          completionFile,
+          controlIdentity,
+          errorInfo ? "error" : "completed",
+          errorInfo?.errorMessage,
+        );
+      } catch {
+        // The wrapper still records process exit. The parent will report the
+        // absent completion record as a recoverable failure rather than success.
+      }
     }
+    control?.notifyCompleted();
+    recorder.agentEndDone();
+    ctx.shutdown();
   });
 
   pi.on("turn_start", (event) => {
@@ -318,6 +336,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", (event) => {
     recorder.sessionShutdown((event as any).reason);
+    control?.close();
+    control = null;
   });
 
   // Toggle expand/collapse with Ctrl+Alt+O

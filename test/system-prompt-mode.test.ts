@@ -1,163 +1,148 @@
-/**
- * Smoke tests for the systemPromptMode feature.
- * Tests: frontmatter parsing, identity routing, CLI flag generation.
- */
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { after, before, describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-let passed = 0;
-let failed = 0;
+const originalCwd = process.cwd();
+const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+const originalAllowed = process.env.PI_SUBAGENT_ALLOWED;
+const root = mkdtempSync(join(tmpdir(), "subagent-system-prompt-"));
+const agentDir = join(root, "agent-dir");
+const projectDir = join(root, "project");
 
-function assert(condition: boolean, msg: string) {
-  if (condition) {
-    console.log(`  ✅ ${msg}`);
-    passed++;
-  } else {
-    console.log(`  ❌ ${msg}`);
-    failed++;
-  }
+before(() => {
+  mkdirSync(join(agentDir, "agents"), { recursive: true });
+  mkdirSync(projectDir, { recursive: true });
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  delete process.env.PI_SUBAGENT_ALLOWED;
+  process.chdir(projectDir);
+});
+
+after(() => {
+  process.chdir(originalCwd);
+  if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+  if (originalAllowed === undefined) delete process.env.PI_SUBAGENT_ALLOWED;
+  else process.env.PI_SUBAGENT_ALLOWED = originalAllowed;
+  rmSync(root, { recursive: true, force: true });
+});
+
+function writeAgent(filename: string, frontmatter: string[], body = ""): void {
+  writeFileSync(
+    join(agentDir, "agents", filename),
+    ["---", ...frontmatter, "---", body, ""].join("\n"),
+  );
 }
 
-// --- Extracted logic under test ---
+describe("production system-prompt routing", { concurrency: 1 }, () => {
+  it("routes replace identity from discovery through fresh preparation and sandbox flags", async () => {
+    writeAgent(
+      "replace-fixture.md",
+      ["name: replace-fixture", "tools: read", "system-prompt: replace", "auto-exit: true"],
+      "You are a replacement identity.",
+    );
 
-function parseFrontmatter(content: string) {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
-  if (!match) return null;
-  const frontmatter = match[1];
-  const get = (key: string) => {
-    const m = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
-    return m ? m[1].trim() : undefined;
-  };
-  const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
-  const spm = get("system-prompt");
-  return {
-    systemPromptMode: spm === "replace" ? "replace" : spm === "append" ? "append" : undefined,
-    body: body || undefined,
-  };
-}
+    const { __test__ } = await import("../pi-extension/subagents/index.ts");
+    const definition = __test__.discoverAgentDefinitions().find((item) => item.name === "replace-fixture");
+    assert.ok(definition);
 
-function simulateRouting(
-  agentBody: string | undefined,
-  systemPromptMode: "append" | "replace" | undefined,
-  paramSystemPrompt: string | undefined,
-) {
-  const identity = agentBody ?? paramSystemPrompt ?? null;
-  const identityInSystemPrompt = systemPromptMode && identity;
-  const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
+    const prepared = __test__.prepareAgentLaunchProfile(
+      { agent: "replace-fixture", task: "Perform the fixture task" },
+      definition,
+    );
+    assert.equal(prepared.loadout.systemPromptMode, "replace");
+    assert.equal(prepared.loadout.identity, "You are a replacement identity.");
+    assert.doesNotMatch(prepared.fullTask, /replacement identity/);
+    assert.match(prepared.fullTask, /Perform the fixture task/);
 
-  let cliFlag: string | null = null;
-  if (identityInSystemPrompt && identity) {
-    cliFlag = systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
-  }
+    const identityDir = join(root, "replace-artifacts");
+    const parts: string[] = [];
+    __test__.applySandboxToParts(parts, {
+      schemaVersion: 2,
+      runtime: "pi",
+      agent: "replace-fixture",
+      ...prepared.loadout,
+      cwd: null,
+      agentDir,
+    }, { artifactDir: identityDir, runId: "replace" });
+    const flagIndex = parts.indexOf("--system-prompt");
+    assert.notEqual(flagIndex, -1);
+    assert.equal(parts.includes("--append-system-prompt"), false);
+    const identityPath = parts[flagIndex + 1].slice(1, -1);
+    assert.equal(existsSync(identityPath), true);
+    assert.equal(readFileSync(identityPath, "utf8"), "You are a replacement identity.");
+  });
 
-  return { roleBlock, cliFlag, identityInSystemPrompt: !!identityInSystemPrompt };
-}
+  it("keeps default and invalid modes in the task instead of selecting a prompt flag", async () => {
+    writeAgent(
+      "default-fixture.md",
+      ["name: default-fixture", "tools: read", "auto-exit: true"],
+      "You are a default identity.",
+    );
+    writeAgent(
+      "invalid-fixture.md",
+      ["name: invalid-fixture", "tools: read", "system-prompt: foobar", "auto-exit: true"],
+      "You are an invalid-mode identity.",
+    );
 
-// --- Fixtures ---
+    const { __test__ } = await import("../pi-extension/subagents/index.ts");
+    const definitions = __test__.discoverAgentDefinitions();
+    for (const [name, identity] of [
+      ["default-fixture", "You are a default identity."],
+      ["invalid-fixture", "You are an invalid-mode identity."],
+    ] as const) {
+      const definition = definitions.find((item) => item.name === name);
+      assert.ok(definition);
+      const prepared = __test__.prepareAgentLaunchProfile(
+        { agent: name, task: "Perform the fixture task" },
+        definition,
+      );
+      assert.equal(prepared.loadout.systemPromptMode, null);
+      assert.equal(prepared.loadout.identity, null);
+      assert.match(prepared.fullTask, new RegExp(identity.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 
-const AGENT_REPLACE = `---
-model: anthropic/claude-sonnet-4-20250514
-system-prompt: replace
-auto-exit: true
----
+      const parts: string[] = [];
+      __test__.applySandboxToParts(parts, {
+        schemaVersion: 2,
+        runtime: "pi",
+        agent: name,
+        ...prepared.loadout,
+        cwd: null,
+        agentDir,
+      }, { artifactDir: join(root, `${name}-artifacts`), runId: name });
+      assert.equal(parts.includes("--system-prompt"), false);
+      assert.equal(parts.includes("--append-system-prompt"), false);
+    }
+  });
 
-You are a specialized agent.`;
+  it("does not emit a prompt flag when a valid mode has no identity body", async () => {
+    writeAgent(
+      "missing-identity.md",
+      ["name: missing-identity", "tools: read", "system-prompt: replace", "auto-exit: true"],
+    );
 
-const AGENT_APPEND = `---
-model: anthropic/claude-sonnet-4-20250514
-system-prompt: append
----
+    const { __test__ } = await import("../pi-extension/subagents/index.ts");
+    const definition = __test__.discoverAgentDefinitions().find((item) => item.name === "missing-identity");
+    assert.ok(definition);
+    const prepared = __test__.prepareAgentLaunchProfile(
+      { agent: "missing-identity", task: "Perform the fixture task" },
+      definition,
+    );
+    assert.equal(prepared.loadout.systemPromptMode, "replace");
+    assert.equal(prepared.loadout.identity, null);
+    assert.match(prepared.fullTask, /Perform the fixture task/);
 
-You are an appended identity.`;
-
-const AGENT_DEFAULT = `---
-model: anthropic/claude-sonnet-4-20250514
----
-
-You are a default agent.`;
-
-const AGENT_INVALID = `---
-model: anthropic/claude-sonnet-4-20250514
-system-prompt: foobar
----
-
-Body here.`;
-
-// --- Test 1: Frontmatter parsing ---
-console.log("\n🧪 Frontmatter parsing of system-prompt field");
-
-const r1 = parseFrontmatter(AGENT_REPLACE)!;
-assert(r1.systemPromptMode === "replace", "system-prompt: replace → mode is 'replace'");
-assert(r1.body === "You are a specialized agent.", "body extracted correctly");
-
-const r2 = parseFrontmatter(AGENT_APPEND)!;
-assert(r2.systemPromptMode === "append", "system-prompt: append → mode is 'append'");
-
-const r3 = parseFrontmatter(AGENT_DEFAULT)!;
-assert(r3.systemPromptMode === undefined, "no system-prompt field → mode is undefined");
-
-const r4 = parseFrontmatter(AGENT_INVALID)!;
-assert(r4.systemPromptMode === undefined, "system-prompt: foobar → mode is undefined (ignored)");
-
-// --- Test 2: Identity routing ---
-console.log("\n🧪 Identity routing (system prompt vs user message)");
-
-const s1 = simulateRouting("You are X.", "replace", undefined);
-assert(s1.roleBlock === "", "replace mode: roleBlock empty (not in task)");
-assert(s1.cliFlag === "--system-prompt", "replace mode: uses --system-prompt flag");
-
-const s2 = simulateRouting("You are X.", "append", undefined);
-assert(s2.roleBlock === "", "append mode: roleBlock empty (not in task)");
-assert(s2.cliFlag === "--append-system-prompt", "append mode: uses --append-system-prompt flag");
-
-const s3 = simulateRouting("You are X.", undefined, undefined);
-assert(s3.roleBlock === "\n\nYou are X.", "no mode: roleBlock contains identity");
-assert(s3.cliFlag === null, "no mode: no CLI flag");
-
-const s4 = simulateRouting(undefined, undefined, undefined);
-assert(s4.roleBlock === "", "no identity: roleBlock empty");
-assert(s4.cliFlag === null, "no identity: no CLI flag");
-
-const s5 = simulateRouting(undefined, "replace", undefined);
-assert(s5.roleBlock === "", "mode set but no body: roleBlock empty");
-assert(s5.cliFlag === null, "mode set but no body: no CLI flag");
-
-const s6 = simulateRouting(undefined, "replace", "Param identity");
-assert(s6.cliFlag === "--system-prompt", "mode + param systemPrompt: uses CLI flag");
-assert(s6.roleBlock === "", "mode + param systemPrompt: roleBlock empty");
-
-// --- Test 3: End-to-end with temp agent files ---
-console.log("\n🧪 End-to-end with temp agent files");
-
-const tmpDir = mkdtempSync(join(tmpdir(), "pi-test-spm-"));
-const agentsDir = join(tmpDir, ".pi", "agents");
-mkdirSync(agentsDir, { recursive: true });
-
-writeFileSync(join(agentsDir, "test-replace.md"), AGENT_REPLACE);
-writeFileSync(join(agentsDir, "test-append.md"), AGENT_APPEND);
-writeFileSync(join(agentsDir, "test-default.md"), AGENT_DEFAULT);
-
-function loadFromDir(name: string) {
-  const p = join(agentsDir, `${name}.md`);
-  if (!existsSync(p)) return null;
-  return parseFrontmatter(readFileSync(p, "utf8"));
-}
-
-const t1 = loadFromDir("test-replace")!;
-assert(t1.systemPromptMode === "replace", "file test-replace.md → replace mode");
-assert(t1.body === "You are a specialized agent.", "file test-replace.md → body correct");
-
-const t2 = loadFromDir("test-append")!;
-assert(t2.systemPromptMode === "append", "file test-append.md → append mode");
-
-const t3 = loadFromDir("test-default")!;
-assert(t3.systemPromptMode === undefined, "file test-default.md → no mode");
-
-rmSync(tmpDir, { recursive: true });
-
-// --- Summary ---
-console.log(`\n${"=".repeat(40)}`);
-console.log(`Results: ${passed} passed, ${failed} failed`);
-if (failed > 0) process.exit(1);
-console.log("All tests passed! ✅\n");
+    const parts: string[] = [];
+    __test__.applySandboxToParts(parts, {
+      schemaVersion: 2,
+      runtime: "pi",
+      agent: "missing-identity",
+      ...prepared.loadout,
+      cwd: null,
+      agentDir,
+    }, { artifactDir: join(root, "missing-artifacts"), runId: "missing" });
+    assert.equal(parts.includes("--system-prompt"), false);
+    assert.equal(parts.includes("--append-system-prompt"), false);
+  });
+});

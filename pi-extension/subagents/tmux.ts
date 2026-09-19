@@ -12,9 +12,18 @@
  */
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import type { RunControlIdentity } from "./control.ts";
+import {
+  inspectSupervisorProcess,
+  readCompletionRecord,
+  readProcessExitRecord,
+  readProcessStartRecord,
+  type ProcessStartRecord,
+  type RunFiles,
+} from "./run-state.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -69,53 +78,183 @@ export function shellEscape(s: string): string {
 
 // ── Pane layout ──
 
-/**
- * tmux layout applied to the subagent window to keep panes evenly sized.
- * Switchable: "even-horizontal" (equal columns, matches Ctrl+b Alt+1),
- * "main-vertical" (big main pane + tiled column), "tiled" (grid).
- */
-const SUBAGENT_TMUX_LAYOUT = "even-horizontal";
+const ROOT_OPTION = "@pi_interactive_subagents_root";
+const LAYOUT_MONITOR_KEY = Symbol.for("pi-interactive-subagents/layout-monitor");
 
-let rebalanceTimer: ReturnType<typeof setTimeout> | null = null;
+interface PaneGeometry {
+  id: string;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  root: string;
+}
+
+interface LayoutMonitor {
+  roots: Set<string>;
+  timer: ReturnType<typeof setInterval> | null;
+}
+
+const layoutMonitor: LayoutMonitor = (() => {
+  const existing = (globalThis as any)[LAYOUT_MONITOR_KEY] as LayoutMonitor | undefined;
+  if (existing) return existing;
+  const created: LayoutMonitor = { roots: new Set(), timer: null };
+  (globalThis as any)[LAYOUT_MONITOR_KEY] = created;
+  return created;
+})();
+
+function paneRoot(surface: string): string | null {
+  try {
+    const value = execFileSync(
+      "tmux",
+      ["show-options", "-p", "-q", "-v", "-t", surface, ROOT_OPTION],
+      { encoding: "utf8" },
+    ).trim();
+    return value.startsWith("%") ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function listWindowPanes(root: string): PaneGeometry[] {
+  const output = execFileSync(
+    "tmux",
+    [
+      "list-panes",
+      "-t",
+      root,
+      "-F",
+      `#{pane_id}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{${ROOT_OPTION}}`,
+    ],
+    { encoding: "utf8" },
+  ).trim();
+  if (!output) return [];
+  return output.split("\n").map((line) => {
+    const [id, left, top, width, height, paneLayoutRoot = ""] = line.split("\t");
+    return {
+      id,
+      left: Number(left),
+      top: Number(top),
+      width: Number(width),
+      height: Number(height),
+      root: paneLayoutRoot,
+    };
+  });
+}
+
+function getLayoutRoot(surface: string): string {
+  return paneRoot(surface) ?? surface;
+}
 
 /**
- * Re-balance subagent panes so repeated splits don't leave them lopsided.
- * tmux halves the target pane on every split and dumps freed space onto a
- * neighbor on close, so without this panes drift to wildly uneven widths.
- * Applies SUBAGENT_TMUX_LAYOUT to the parent pi window. Debounced so a burst
- * of parallel spawns or staggered exits collapses into a single layout call,
- * and non-fatal: a cosmetic resize must never break spawning or watching.
+ * Restore the managed layout without running select-layout over arbitrary
+ * panes. The root Pi pane and panes tagged with its id are one ownership scope.
+ * If anything else shares the window, leave that manual layout alone.
  */
-function rebalanceSurfaces(hintPane?: string): void {
-  // Prefer the parent pi pane (stable; survives a closing subagent pane).
-  const target = process.env.TMUX_PANE ?? hintPane;
-  if (!target) return;
-  if (rebalanceTimer) clearTimeout(rebalanceTimer);
-  rebalanceTimer = setTimeout(() => {
-    rebalanceTimer = null;
-    try {
-      // -t <pane> resolves to that pane's window; does not change focus.
-      execFileSync("tmux", ["select-layout", "-t", target, SUBAGENT_TMUX_LAYOUT], {
+function rebalanceRoot(root: string): boolean {
+  try {
+    const panes = listWindowPanes(root);
+    if (!panes.some((pane) => pane.id === root)) return false;
+
+    const owned = panes
+      .filter((pane) => pane.id !== root && pane.root === root)
+      .sort((a, b) => a.top - b.top || a.left - b.left);
+    if (owned.length === 0) return false;
+
+    // A foreign pane means this is no longer an exclusively managed window.
+    // Targeted splits may coexist with it, but must not rewrite its geometry.
+    if (panes.some((pane) => pane.id !== root && pane.root !== root)) return true;
+
+    const main = panes.find((pane) => pane.id === root)!;
+    const windowWidth = Math.max(...panes.map((pane) => pane.left + pane.width));
+    const windowHeight = Math.max(...panes.map((pane) => pane.top + pane.height));
+
+    // One cell is the vertical separator. Give an odd spare content cell to
+    // the main pane, so the left side is never narrower than the right side.
+    const mainWidth = Math.ceil((windowWidth - 1) / 2);
+    if (main.width !== mainWidth) {
+      execFileSync("tmux", ["resize-pane", "-t", root, "-x", String(mainWidth)], {
         encoding: "utf8",
       });
-    } catch {
-      // Pane/window may be gone; balancing is best-effort.
     }
-  }, 120);
+
+    // The right stack has one horizontal separator between adjacent panes.
+    const availableHeight = windowHeight - (owned.length - 1);
+    const baseHeight = Math.floor(availableHeight / owned.length);
+    const extraCells = availableHeight % owned.length;
+    for (let index = 0; index < owned.length; index += 1) {
+      const height = baseHeight + (index < extraCells ? 1 : 0);
+      if (owned[index].height !== height) {
+        execFileSync("tmux", ["resize-pane", "-t", owned[index].id, "-y", String(height)], {
+          encoding: "utf8",
+        });
+      }
+    }
+    return true;
+  } catch {
+    // A pane or window can disappear between queries. Layout is best-effort
+    // and must never turn a cosmetic resize into a lifecycle failure.
+    return false;
+  }
+}
+
+function monitorLayouts(): void {
+  for (const root of [...layoutMonitor.roots]) {
+    if (!rebalanceRoot(root)) layoutMonitor.roots.delete(root);
+  }
+  if (layoutMonitor.roots.size === 0 && layoutMonitor.timer) {
+    clearInterval(layoutMonitor.timer);
+    layoutMonitor.timer = null;
+  }
+}
+
+function watchLayout(root: string): void {
+  layoutMonitor.roots.add(root);
+  rebalanceRoot(root);
+  if (layoutMonitor.timer) return;
+  layoutMonitor.timer = setInterval(monitorLayouts, 500);
+  layoutMonitor.timer.unref?.();
+}
+
+function markOwnedSurface(surface: string, root: string): void {
+  execFileSync("tmux", ["set-option", "-p", "-t", surface, ROOT_OPTION, root], {
+    encoding: "utf8",
+  });
 }
 
 // ── Surface primitives ──
 
 /**
- * Create a new pane for a subagent: a right split off the parent pi's pane,
- * so new panes follow the agent rather than the user's focus.
+ * Create a new pane for a subagent. The first pane splits right from the root
+ * Pi pane; later and nested panes split the largest pane in the owned stack.
+ * Explicit targets make placement independent of focus and pane index.
  * See https://github.com/HazAT/pi-interactive-subagents/issues/12
  *
  * Returns the new pane id (e.g. `%12`).
  */
 export function createSurface(name: string): string {
   void name; // tmux panes are not named; the pi process inside shows its own title.
-  return createSurfaceSplit(name, "right", process.env.TMUX_PANE);
+  requireTmux();
+  const parent = process.env.TMUX_PANE;
+  if (!parent) throw new Error("TMUX_PANE is required to place a subagent pane");
+
+  const root = getLayoutRoot(parent);
+  const owned = listWindowPanes(root)
+    .filter((pane) => pane.id !== root && pane.root === root)
+    .sort((a, b) => b.height - a.height || a.top - b.top);
+
+  // The first child forms the right column. Later children divide the largest
+  // right-column pane vertically, preserving the root as a full-height left pane.
+  const target = owned[0]?.id ?? root;
+  const pane = createSurfaceSplit(name, owned.length === 0 ? "right" : "down", target);
+  try {
+    markOwnedSurface(pane, root);
+  } catch (error) {
+    try { execFileSync("tmux", ["kill-pane", "-t", pane]); } catch {}
+    throw error;
+  }
+  watchLayout(root);
+  return pane;
 }
 
 /**
@@ -149,7 +288,6 @@ export function createSurfaceSplit(
     throw new Error(`Unexpected tmux split-window output: ${pane}`);
   }
 
-  rebalanceSurfaces(pane);
   return pane;
 }
 
@@ -196,7 +334,9 @@ export function sendLongCommand(
   scriptParts.push(command);
 
   writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
-    mode: 0o755,
+    // Launch scripts contain per-run control credentials. The pane shell only
+    // needs owner execution; never expose them to other local users.
+    mode: 0o700,
   });
   sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
   return scriptPath;
@@ -234,110 +374,162 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
  */
 export function closeSurface(surface: string): void {
   requireTmux();
+  const root = paneRoot(surface);
   execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
-  rebalanceSurfaces();
+  if (root) watchLayout(root);
 }
 
 // ── Exit polling ──
 
+export interface SurfaceIdentity {
+  paneId: string;
+  panePid: number;
+  windowId: string;
+}
+
+export function getSurfaceIdentity(surface: string): SurfaceIdentity {
+  requireTmux();
+  const output = execFileSync(
+    "tmux",
+    ["display-message", "-p", "-t", surface, "#{pane_id}\t#{pane_pid}\t#{window_id}"],
+    { encoding: "utf8" },
+  ).trim();
+  const [paneId, rawPid, windowId] = output.split("\t");
+  const panePid = Number(rawPid);
+  if (!paneId?.startsWith("%") || !Number.isInteger(panePid) || !windowId) {
+    throw new Error(`Unexpected tmux pane identity: ${output}`);
+  }
+  return { paneId, panePid, windowId };
+}
+
 export interface PollResult {
-  /** How the subagent exited */
-  reason: "done" | "sentinel" | "error";
-  /** Shell exit code (from sentinel). 0 for file-based exits. */
+  reason:
+    | "completed"
+    | "error"
+    | "process-exit"
+    | "startup-timeout"
+    | "supervisor-lost"
+    | "supervisor-reused"
+    | "invalid-run-record"
+    | "surface-missing"
+    | "surface-reused";
   exitCode: number;
-  /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
   errorMessage?: string;
 }
 
-/**
- * Interpret an `.exit` sidecar payload (written by the error path in
- * subagent-done.ts). Centralized so both the fast and slow paths in
- * pollForExit decode the payload the same way. Clean completions write no
- * sidecar and are detected via the terminal sentinel instead.
- *
- * Note: ask_question does NOT write a `.exit` sidecar — it keeps the session
- * open and signals the parent via a separate `.ask` file (see deliverPendingQuestion).
- */
-function interpretExitSidecar(data: any): PollResult {
-  if (data?.type === "error") {
-    const errorMessage =
-      typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
-        ? data.errorMessage
-        : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
-    return { reason: "error", exitCode: 1, errorMessage };
-  }
-  return { reason: "done", exitCode: 0 };
+function sameSurface(expected: SurfaceIdentity, actual: SurfaceIdentity): boolean {
+  return expected.paneId === actual.paneId && expected.panePid === actual.panePid && expected.windowId === actual.windowId;
 }
 
-export const __pollForExitTest__ = { interpretExitSidecar };
-
 /**
- * Poll until the subagent exits. Checks for a `.exit` sidecar file first
- * (written by the error path), falling back to the terminal sentinel for
- * clean-completion and crash detection.
+ * Wait for the per-run wrapper exit sidecar. Completion intent is recorded by
+ * the child at `agent_settled`; the wrapper record proves the Pi process has
+ * actually exited even though the pane's interactive shell remains alive.
+ * Missing and identity-changed panes are explicit failures, never ignored.
  */
 export async function pollForExit(
   surface: string,
   signal: AbortSignal,
   options: {
     interval: number;
-    sessionFile?: string;
-    sentinelFile?: string;
+    identity: RunControlIdentity;
+    runFiles: RunFiles;
+    surfaceIdentity: SurfaceIdentity;
+    completionRequired?: boolean;
+    startupDeadlineMs?: number;
+    missingExitRecordGraceMs?: number;
     onTick?: (elapsed: number) => void;
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  const startupDeadlineMs = options.startupDeadlineMs ?? 10_000;
+  const missingExitRecordGraceMs = options.missingExitRecordGraceMs ?? 500;
+  let processStart: ProcessStartRecord | null = null;
+  let supervisorMissingSince: number | null = null;
 
   for (;;) {
-    if (signal.aborted) {
-      throw new Error("Aborted while waiting for subagent to finish");
+    if (signal.aborted) throw new Error("Aborted while waiting for subagent to finish");
+
+    const processExit = readProcessExitRecord(options.runFiles.exitFile, options.identity);
+    if (processExit) {
+      const completion = readCompletionRecord(options.runFiles.completionFile, options.identity);
+      if (completion?.status === "error") {
+        return {
+          reason: "error",
+          exitCode: processExit.exitCode || 1,
+          errorMessage: completion.errorMessage || "The subagent settled with an agent error.",
+        };
+      }
+      if (completion?.status === "completed" || (!options.completionRequired && processExit.exitCode === 0)) {
+        return { reason: "completed", exitCode: processExit.exitCode };
+      }
+      return {
+        reason: "process-exit",
+        exitCode: processExit.exitCode || 1,
+        errorMessage: "The subagent process exited without an authenticated completion record; the run may be resumed.",
+      };
     }
 
-    // Fast path: check for .exit sidecar file (written by the error path)
-    if (options.sessionFile) {
-      try {
-        const exitFile = `${options.sessionFile}.exit`;
-        if (existsSync(exitFile)) {
-          const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-          rmSync(exitFile, { force: true });
-          return interpretExitSidecar(data);
+    if (!processStart) {
+      processStart = readProcessStartRecord(options.runFiles.startFile, options.identity);
+      if (!processStart && existsSync(options.runFiles.startFile)) {
+        return {
+          reason: "invalid-run-record",
+          exitCode: 1,
+          errorMessage: "The supervisor start record does not match this run identity; the run may be resumed.",
+        };
+      }
+      if (!processStart && Date.now() - start >= startupDeadlineMs) {
+        return {
+          reason: "startup-timeout",
+          exitCode: 1,
+          errorMessage: "The subagent supervisor did not publish a start record before the startup deadline.",
+        };
+      }
+    }
+
+    if (processStart) {
+      const supervisorState = inspectSupervisorProcess(processStart);
+      if (supervisorState === "reused") {
+        return {
+          reason: "supervisor-reused",
+          exitCode: 1,
+          errorMessage: "The recorded supervisor PID now belongs to another process; refusing to observe or terminate it.",
+        };
+      }
+      if (supervisorState === "missing") {
+        supervisorMissingSince ??= Date.now();
+        if (Date.now() - supervisorMissingSince >= missingExitRecordGraceMs) {
+          return {
+            reason: "supervisor-lost",
+            exitCode: 1,
+            errorMessage: "The tracked supervisor exited without its authenticated exit record; the run may be resumed.",
+          };
         }
-      } catch {}
+      } else {
+        supervisorMissingSince = null;
+      }
     }
 
-    // Check Claude sentinel file (written by plugin Stop hook)
-    if (options.sentinelFile) {
-      try {
-        if (existsSync(options.sentinelFile)) {
-          return { reason: "sentinel", exitCode: 0 };
-        }
-      } catch {}
-    }
-
-    // Slow path: read terminal screen for sentinel (crash detection)
+    let actualIdentity: SurfaceIdentity;
     try {
-      const screen = await readScreenAsync(surface, 5);
-      const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
-      if (match) {
-        return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
-      }
+      actualIdentity = getSurfaceIdentity(surface);
     } catch {
-      // Surface may have been destroyed — check if .exit file appeared in the meantime
-      if (options.sessionFile) {
-        try {
-          const exitFile = `${options.sessionFile}.exit`;
-          if (existsSync(exitFile)) {
-            const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-            rmSync(exitFile, { force: true });
-            return interpretExitSidecar(data);
-          }
-        } catch {}
-      }
+      return {
+        reason: "surface-missing",
+        exitCode: 1,
+        errorMessage: "The subagent tmux pane disappeared before its wrapper wrote an exit record; the run may be resumed.",
+      };
+    }
+    if (!sameSurface(options.surfaceIdentity, actualIdentity)) {
+      return {
+        reason: "surface-reused",
+        exitCode: 1,
+        errorMessage: "The tracked tmux target no longer has the identity assigned to this run; refusing to observe or close the replacement pane.",
+      };
     }
 
-    const elapsed = Math.floor((Date.now() - start) / 1000);
-    options.onTick?.(elapsed);
-
+    options.onTick?.(Math.floor((Date.now() - start) / 1000));
     await new Promise<void>((resolve, reject) => {
       if (signal.aborted) return reject(new Error("Aborted"));
       const timer = setTimeout(() => {

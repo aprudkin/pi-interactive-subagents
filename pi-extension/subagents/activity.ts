@@ -331,7 +331,7 @@ export function createSubagentActivityRecorder(params: {
   function flushNow(): void {
     if (disabled) return;
     try {
-      writeSubagentActivityFile(activityFile, activity);
+      writeSubagentActivityFile(activityFile!, activity);
       lastFlushAt = now();
       failureCount = 0;
     } catch {
